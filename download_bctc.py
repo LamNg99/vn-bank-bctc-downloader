@@ -12,13 +12,12 @@ Usage:
     python download_bctc.py [--dry-run] [--banks abb acb ...] [--years 2020 2021 ...]
 """
 
-import asyncio
 import argparse
+import asyncio
 import json
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
 
 import httpx
 
@@ -32,14 +31,19 @@ BANKS = [
 
 YEARS = list(range(2010, 2025))   # 2010 … 2024 inclusive
 
-API_URL  = "https://cafef.vn/du-lieu/Ajax/PageNew/FileBCTC.ashx"
-OUT_DIR  = Path("financial_reports")
+API_URL = "https://cafef.vn/du-lieu/Ajax/PageNew/FileBCTC.ashx"
+OUT_DIR = Path("financial_reports")
 LOG_FILE = OUT_DIR / "download_log.json"
 
 # Polite concurrency — don't hammer the server
 MAX_CONCURRENT = 4
-RETRY_DELAY    = 2.0   # seconds between retries
-MAX_RETRIES    = 3
+RETRY_DELAY = 2.0   # seconds between retries
+MAX_RETRIES = 3
+
+# Magic-value constants
+ANNUAL_QUARTER = 5   # cafef Quarter==5 means the full-year annual report
+HTTP_OK_MAX = 400    # status codes below this are considered successful
+HTTP_NOT_FOUND = 404
 
 HEADERS = {
     "User-Agent": (
@@ -97,7 +101,7 @@ REPORT_TARGETS: list[ReportTarget] = [
 
 def find_report(
     data: list[dict], year: int, target: ReportTarget
-) -> Optional[dict]:
+) -> dict | None:
     """
     Try exact name match first; fall back to keyword match on annual (Quarter==5)
     entries that satisfy loose_must / loose_must_not.
@@ -110,7 +114,7 @@ def find_report(
     # Loose fallback — must be annual (Quarter == 5) and contain the year
     for item in data:
         name = item.get("Name", "")
-        if item.get("Quarter") != 5:
+        if item.get("Quarter") != ANNUAL_QUARTER:
             continue
         if str(year) not in name:
             continue
@@ -134,9 +138,20 @@ def file_extension(url: str) -> str:
 def color(text: str, code: str) -> str:
     return f"\033[{code}m{text}\033[0m" if sys.stdout.isatty() else text
 
-ok_  = lambda t: color(t, "32")   # green
-err_ = lambda t: color(t, "31")   # red
-dim_ = lambda t: color(t, "2")    # dim
+
+def ok_(t: str) -> str:
+    """Wrap text in green ANSI."""
+    return color(t, "32")
+
+
+def err_(t: str) -> str:
+    """Wrap text in red ANSI."""
+    return color(t, "31")
+
+
+def dim_(t: str) -> str:
+    """Wrap text in dim ANSI."""
+    return color(t, "2")
 
 
 # ── CDN fallback hosts (tried in order when the primary URL 404s) ──────────────
@@ -145,13 +160,13 @@ CDN_FALLBACKS: list[tuple[str, str]] = [
     # Try every known CDN host variant when the primary URL 404s
     ("cafefnew.mediacdn.vn", "cafef1.mediacdn.vn"),   # most common fix
     ("cafefnew.mediacdn.vn", "cafef.mediacdn.vn"),
-    ("cafef.mediacdn.vn",    "cafef1.mediacdn.vn"),
-    ("cafef.mediacdn.vn",    "cafefnew.mediacdn.vn"),
-    ("cafef1.mediacdn.vn",   "cafefnew.mediacdn.vn"),
-    ("cafef1.mediacdn.vn",   "cafef.mediacdn.vn"),
+    ("cafef.mediacdn.vn", "cafef1.mediacdn.vn"),
+    ("cafef.mediacdn.vn", "cafefnew.mediacdn.vn"),
+    ("cafef1.mediacdn.vn", "cafefnew.mediacdn.vn"),
+    ("cafef1.mediacdn.vn", "cafef.mediacdn.vn"),
     ("cafefnew.mediacdn.vn", "static.cafef.vn"),
-    ("cafef.mediacdn.vn",    "static.cafef.vn"),
-    ("cafef1.mediacdn.vn",   "static.cafef.vn"),
+    ("cafef.mediacdn.vn", "static.cafef.vn"),
+    ("cafef1.mediacdn.vn", "static.cafef.vn"),
 ]
 
 
@@ -159,7 +174,7 @@ CDN_FALLBACKS: list[tuple[str, str]] = [
 
 async def fetch_report_list(
     client: httpx.AsyncClient, symbol: str, year: int
-) -> Optional[list[dict]]:
+) -> list[dict] | None:
     params = {"Symbol": symbol.upper(), "Type": "1", "Year": str(year)}
     for attempt in range(1, MAX_RETRIES + 1):
         try:
@@ -177,7 +192,7 @@ async def fetch_report_list(
     return None
 
 
-async def resolve_url(client: httpx.AsyncClient, url: str) -> Optional[str]:
+async def resolve_url(client: httpx.AsyncClient, url: str) -> str | None:
     """
     HEAD-check the URL; if it returns 404 try known CDN host alternatives.
     Returns the first working URL, or None if all candidates fail.
@@ -198,11 +213,11 @@ async def resolve_url(client: httpx.AsyncClient, url: str) -> Optional[str]:
     for candidate in unique:
         try:
             r = await client.head(candidate, timeout=15)
-            if r.status_code < 400:
+            if r.status_code < HTTP_OK_MAX:
                 if candidate != url:
                     print(color(f"    ↪ resolved via alt CDN: {candidate}", "33"))
                 return candidate
-            if r.status_code == 404 and candidate == url:
+            if r.status_code == HTTP_NOT_FOUND and candidate == url:
                 continue   # try fallbacks
         except Exception:
             continue
@@ -228,7 +243,7 @@ async def download_file(
             dest.parent.mkdir(parents=True, exist_ok=True)
             async with client.stream("GET", resolved, timeout=120) as resp:
                 resp.raise_for_status()
-                with open(dest, "wb") as fh:
+                with Path(dest).open("wb") as fh:
                     async for chunk in resp.aiter_bytes(8192):
                         fh.write(chunk)
             return True, resolved
@@ -279,11 +294,11 @@ async def process(
                 log.append(entry)
                 continue
 
-            ext  = file_extension(link)
+            ext = file_extension(link)
             name = f"{symbol.upper()}_BCTC_{target.file_tag}_{year}{ext}"
             dest = OUT_DIR / symbol.upper() / name
             entry["file"] = str(dest)
-            entry["url"]  = link
+            entry["url"] = link
             entry["name"] = report.get("Name", "")
 
             if dest.exists():
@@ -311,7 +326,7 @@ async def process(
             await asyncio.sleep(0.3)   # polite gap between downloads
 
         if not any_found:
-            print(dim_(f"  – {symbol.upper()} {year}: no matching reports found"))
+            print(dim_(f"  - {symbol.upper()} {year}: no matching reports found"))
 
 
 # ── Broken-link recovery ───────────────────────────────────────────────────────
@@ -329,11 +344,11 @@ async def recover_broken(
     For one broken-link log entry, try fetching the report list with every
     exchange Type and look for the same report Name.  Returns an updated entry.
     """
-    symbol    = entry["symbol"]
-    year      = entry["year"]
-    file_tag  = entry["type"]
+    symbol = entry["symbol"]
+    year = entry["year"]
+    file_tag = entry["type"]
     want_name = entry.get("name", "")
-    dest      = Path(entry["file"])
+    dest = Path(entry["file"])
 
     # Find the matching ReportTarget so we can call find_report
     target = next((t for t in REPORT_TARGETS if t.file_tag == file_tag), None)
@@ -371,8 +386,8 @@ async def recover_broken(
                 success, detail = await download_file(client, link, dest)
                 if success:
                     new_entry = dict(entry)
-                    new_entry["status"]       = "ok"
-                    new_entry["url"]          = link
+                    new_entry["status"] = "ok"
+                    new_entry["url"] = link
                     new_entry["resolved_url"] = detail
                     new_entry["recovered_via_type"] = type_code
                     return new_entry
@@ -388,7 +403,7 @@ async def run_recovery(log_path: Path) -> None:
         print(err_(f"Log not found: {log_path}"))
         return
 
-    with open(log_path, encoding="utf-8") as fh:
+    with Path(log_path).open(encoding="utf-8") as fh:
         log: list[dict] = json.load(fh)
 
     broken = [e for e in log if e.get("status") == "broken_link"]
@@ -414,11 +429,11 @@ async def run_recovery(log_path: Path) -> None:
         if key in index:
             log[index[key]] = updated
 
-    with open(log_path, "w", encoding="utf-8") as fh:
+    with Path(log_path).open("w", encoding="utf-8") as fh:
         json.dump(log, fh, ensure_ascii=False, indent=2)
 
-    recovered  = sum(1 for r in results if r.get("status") == "ok")
-    still_bad  = len(results) - recovered
+    recovered = sum(1 for r in results if r.get("status") == "ok")
+    still_bad = len(results) - recovered
     print()
     print("─" * 55)
     print(ok_(f"  Recovered   : {recovered}"))
@@ -439,13 +454,13 @@ async def run_recovery(log_path: Path) -> None:
 
 async def run(banks: list[str], years: list[int], dry_run: bool) -> None:
     OUT_DIR.mkdir(exist_ok=True)
-    sem  = asyncio.Semaphore(MAX_CONCURRENT)
+    sem = asyncio.Semaphore(MAX_CONCURRENT)
     log: list[dict] = []
 
     target_labels = " | ".join(f"[{t.file_tag}] {t.exact_name.format(year='YYYY')}" for t in REPORT_TARGETS)
     total = len(banks) * len(years)
     print(f"Banks  : {', '.join(b.upper() for b in banks)}")
-    print(f"Years  : {years[0]}–{years[-1]}")
+    print(f"Years  : {years[0]}-{years[-1]}")
     print(f"Tasks  : {total} bank-year pairs  (concurrency={MAX_CONCURRENT})")
     print(f"Types  : {target_labels}")
     print(f"Output : {OUT_DIR.resolve()}")
@@ -462,7 +477,7 @@ async def run(banks: list[str], years: list[int], dry_run: bool) -> None:
         await asyncio.gather(*tasks)
 
     # Persist full log
-    with open(LOG_FILE, "w", encoding="utf-8") as fh:
+    with Path(LOG_FILE).open("w", encoding="utf-8") as fh:
         json.dump(log, fh, ensure_ascii=False, indent=2)
 
     # Summary
@@ -501,7 +516,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--years", nargs="+", type=int, metavar="YEAR",
         default=YEARS,
-        help="Years to download (default: 2010–2025)",
+        help="Years to download (default: 2010-2025)",
     )
     p.add_argument(
         "--dry-run", action="store_true",
