@@ -1,0 +1,14 @@
+# Virtual environment
+.venv/
+
+# Downloaded reports and logs
+financial_reports
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# macOS
+.DS_Store
