@@ -132,12 +132,12 @@ def parse_json(raw: str) -> dict:
 
 # 1×1 white JPEG in base64 — minimal valid image for a vision probe
 _PROBE_IMG = (
-    "/9j/4AAQSkZJRgABAQEASABIAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8U"
-    "HRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/wAARC"
-    "AABAAEDASIA"
-    "AhEBAxEB/8QAFgABAQEAAAAAAAAAAAAAAAAABgUEB"
-    "AABAQEBAQEAAAAAAAAAAAAAAAMCAQQA/8QAFBEBAAAAAAAAAAAAAAAAAAAAAf/"
-    "EABQRAQAAAAAAAAAAAAAAAAAAAAD/2gAMAwEAAhEDEQA/AKdgAB//2Q=="
+    "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8U"
+    "HRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/2wBDAQkJCQwLDBgN"
+    "DRgyIRwhMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIy"
+    "MjIyMjL/wAARCAAEAAQDASIAAhEBAxEB/8QAFAABAAAAAAAAAAAAAAAAAAAACf/EABQQAQAA"
+    "AAAAAAAAAAAAAAAAAAAA/8QAFBABAAAAAAAAAAAAAAAAAAAAAP/EABQRAQAAAAAAAAAAAAAAA"
+    "AAAAP/aAAwDAQACEQMRAD8AJQAA/9k="
 )
 
 
@@ -164,7 +164,7 @@ async def probe_vision(client: httpx.AsyncClient) -> None:
         err_msg = (data.get("error") or {}).get("message", "")
         if r.status_code >= 400 and any(
             kw in err_msg.lower()
-            for kw in ["image", "vision", "multimodal", "not support", "invalid"]
+            for kw in ["does not support", "vision not", "no vision", "multimodal not", "not support image"]
         ):
             print(err_(f"✗ Model '{MODEL}' does not support vision input: {err_msg}"))
             raise SystemExit(1)
