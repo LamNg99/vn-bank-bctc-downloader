@@ -15,6 +15,7 @@ Usage:
 import argparse
 import asyncio
 import json
+import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -24,9 +25,9 @@ import httpx
 # ── Configuration ──────────────────────────────────────────────────────────────
 
 BANKS = [
-    "abb", "acb", "bab", "bid", "bvb", "ctg", "eib", "hdb", "klb", "lpb",
-    "mbb", "msb", "nab", "nvb", "ocb", "pgb", "scb", "sgb", "shb", "ssb",
-    "stb", "tcb", "tpb", "vcb", "vib", "vpb",
+    "abb", "acb", "agr", "bab", "bid", "bvb", "ctg", "eib", "hdb", "klb",
+    "lpb", "mbb", "msb", "nab", "nvb", "ocb", "pgb", "scb", "sgb", "shb",
+    "ssb", "stb", "tcb", "tpb", "vab", "vbb", "vcb", "vib", "vpb", "pcb"
 ]
 
 YEARS = list(range(2010, 2025))   # 2010 … 2024 inclusive
@@ -34,6 +35,24 @@ YEARS = list(range(2010, 2025))   # 2010 … 2024 inclusive
 API_URL = "https://cafef.vn/du-lieu/Ajax/PageNew/FileBCTC.ashx"
 OUT_DIR = Path("financial_reports")
 LOG_FILE = OUT_DIR / "download_log.json"
+
+# ── Vietstock fallback API ─────────────────────────────────────────────────────
+VIETSTOCK_HOME = "https://finance.vietstock.vn/"
+VIETSTOCK_API  = "https://finance.vietstock.vn/data/getdocument"
+
+VIETSTOCK_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/125.0.0.0 Safari/537.36"
+    ),
+    "Referer": VIETSTOCK_HOME,
+    "Origin": "https://finance.vietstock.vn",
+    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+    "X-Requested-With": "XMLHttpRequest",
+    "Accept": "application/json, text/javascript, */*; q=0.01",
+    "Accept-Language": "vi-VN,vi;q=0.9,en-US;q=0.8",
+}
 
 # Polite concurrency — don't hammer the server
 MAX_CONCURRENT = 4
@@ -154,6 +173,112 @@ def dim_(t: str) -> str:
     return color(t, "2")
 
 
+# ── Vietstock fallback helpers ────────────────────────────────────────────────
+
+async def get_vietstock_token(client: httpx.AsyncClient) -> str | None:
+    """
+    GET the vietstock finance homepage so the server sets the anti-forgery
+    cookie, then extract the paired hidden-field token from the HTML.
+    ASP.NET anti-forgery uses *two* values: a cookie (sent automatically by the
+    client on subsequent requests) and a form-field value that must be posted
+    explicitly — this function returns the form-field value.
+    """
+    # Attribute value pattern: handles both quoted ("…"/'…') and unquoted (ends
+    # at next whitespace or '>') attribute values as seen in minified HTML.
+    _val = r'''(?:"([^"]+)"|'([^']+)'|([^\s>]+))'''
+
+    try:
+        resp = await client.get(VIETSTOCK_HOME, timeout=30)
+        html = resp.text
+
+        # Pattern: name=__RequestVerificationToken … value=TOKEN (any attr order)
+        for pattern in (
+            rf'name=(?:"__RequestVerificationToken"|__RequestVerificationToken)[^>]*value={_val}',
+            rf'value={_val}[^>]*name=(?:"__RequestVerificationToken"|__RequestVerificationToken)',
+        ):
+            m = re.search(pattern, html)
+            if m:
+                # Return whichever capture group matched (quoted or unquoted)
+                return next(g for g in m.groups() if g is not None)
+
+    except Exception as exc:
+        print(dim_(f"  [vietstock] could not fetch token: {exc}"))
+    return None
+
+
+async def fetch_vietstock_report_list(
+    client: httpx.AsyncClient,
+    symbol: str,
+    year: int,
+    token: str,
+    page: int = 1,
+    doc_type: int = 1,
+) -> list[dict]:
+    """
+    POST to the vietstock getdocument endpoint and return the JSON array.
+    Returns an empty list on any error.
+    Response items have keys: FileInfoID, Url, Title, FullName, FileExt, …
+    """
+    payload = {
+        "code": symbol.upper(),
+        "page": str(page),
+        "year": str(year),
+        "type": str(doc_type),
+        "__RequestVerificationToken": token,
+    }
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            resp = await client.post(
+                VIETSTOCK_API, data=payload, timeout=30,
+                headers=VIETSTOCK_HEADERS,
+            )
+            resp.raise_for_status()
+            result = resp.json()
+            # API may return a list directly or wrap it
+            if isinstance(result, list):
+                return result
+            if isinstance(result, dict):
+                return result.get("Data") or result.get("data") or []
+        except (httpx.HTTPError, json.JSONDecodeError) as exc:
+            if attempt < MAX_RETRIES:
+                await asyncio.sleep(RETRY_DELAY * attempt)
+            else:
+                print(dim_(f"  [vietstock] API {symbol.upper()} {year}: {exc}"))
+    return []
+
+
+def find_vietstock_report(
+    records: list[dict], year: int, target: ReportTarget
+) -> dict | None:
+    """
+    Search vietstock records (Title / FullName fields) using the same
+    loose_must / loose_must_not keyword rules as the cafef find_report().
+    Returns a normalised dict with a "Link" key so the download pipeline
+    can treat it identically to a cafef record.
+    Target for Consolidated: Title must contain "hợp nhất" and "kiểm toán".
+    """
+    for rec in records:
+        # vietstock uses Title / FullName instead of Name
+        title = (rec.get("FullName") or rec.get("Title") or "").lower()
+        if str(year) not in title:
+            continue
+        if not all(kw.lower() in title for kw in target.loose_must):
+            continue
+        if any(kw.lower() in title for kw in target.loose_must_not):
+            continue
+        url = rec.get("Url", "").strip()
+        if not url:
+            continue
+        # Normalise to match cafef record shape expected by process()
+        return {
+            **rec,
+            "Link": url,
+            "Name": rec.get("FullName") or rec.get("Title") or "",
+            "_source": "vietstock",
+        }
+    return None
+
+
 # ── CDN fallback hosts (tried in order when the primary URL 404s) ──────────────
 
 CDN_FALLBACKS: list[tuple[str, str]] = [
@@ -263,8 +388,14 @@ async def process(
     sem: asyncio.Semaphore,
     log: list[dict],
     dry_run: bool,
+    vs_client: httpx.AsyncClient | None = None,
+    vs_token: str | None = None,
 ) -> None:
-    """Fetch the report list once, then try every target type."""
+    """Fetch the report list once, then try every target type.
+
+    When cafef returns no match for a target, the vietstock API is tried as a
+    fallback (requires *vs_client* and *vs_token* to be provided).
+    """
     async with sem:
         data = await fetch_report_list(client, symbol, year)
 
@@ -276,6 +407,22 @@ async def process(
 
         for target in REPORT_TARGETS:
             report = find_report(data, year, target)
+
+            # ── Vietstock fallback ─────────────────────────────────────────
+            if report is None and vs_client is not None and vs_token is not None:
+                vs_records = await fetch_vietstock_report_list(
+                    vs_client, symbol, year, vs_token
+                )
+                if vs_records:
+                    report = find_vietstock_report(vs_records, year, target)
+                    if report:
+                        print(color(
+                            f"  [vietstock] {symbol.upper()} {year} [{target.file_tag}]: "
+                            f"found via vietstock fallback",
+                            "33",
+                        ))
+            # ──────────────────────────────────────────────────────────────
+
             entry: dict = {
                 "symbol": symbol,
                 "year": year,
@@ -468,13 +615,31 @@ async def run(banks: list[str], years: list[int], dry_run: bool) -> None:
         print(color("  *** DRY RUN — no files will be downloaded ***", "33"))
     print()
 
+    # ── Vietstock fallback session ─────────────────────────────────────────────
+    vs_client = httpx.AsyncClient(
+        headers=VIETSTOCK_HEADERS, follow_redirects=True, cookies={}
+    )
+    print("Fetching vietstock anti-forgery token …", end=" ", flush=True)
+    vs_token = await get_vietstock_token(vs_client)
+    if vs_token:
+        print(ok_("ok"))
+    else:
+        print(err_("failed — vietstock fallback disabled for this run"))
+    print()
+    # ──────────────────────────────────────────────────────────────────────────
+
     async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True) as client:
         tasks = [
-            process(client, symbol, year, sem, log, dry_run)
+            process(client, symbol, year, sem, log, dry_run,
+                    vs_client=vs_client if vs_token else None,
+                    vs_token=vs_token)
             for symbol in banks
             for year in years
         ]
-        await asyncio.gather(*tasks)
+        try:
+            await asyncio.gather(*tasks)
+        finally:
+            await vs_client.aclose()
 
     # Persist full log
     with Path(LOG_FILE).open("w", encoding="utf-8") as fh:
